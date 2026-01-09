@@ -11,6 +11,7 @@
 #include "kitemviews/kitemmodelbase.h"
 
 #include <list>
+#include <deque>
 
 #include "config-dolphin.h"
 #include <KFileItem>
@@ -396,7 +397,7 @@ private:
 
     // Items which have been left over from the last call of startPreviewJob().
     // A new preview job will be started from them once the first one finishes.
-    KFileItemList m_pendingPreviewItems;
+    std::deque<KFileItem> m_pendingPreviewItems;
 
     QList<KIO::PreviewJob *> m_previewJobs;
     int m_maxConcurrentJobs;
