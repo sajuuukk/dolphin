@@ -398,7 +398,8 @@ private:
     // A new preview job will be started from them once the first one finishes.
     KFileItemList m_pendingPreviewItems;
 
-    KIO::PreviewJob *m_previewJob;
+    QList<KIO::PreviewJob *> m_previewJobs;
+    int m_maxConcurrentJobs;
 
     // Info about the item that the user currently hovers, and the current sequence
     // index for thumb generation.

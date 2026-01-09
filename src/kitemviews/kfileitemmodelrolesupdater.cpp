@@ -31,10 +31,12 @@
 #endif
 
 #include <QApplication>
+#include <QCache>
 #include <QElapsedTimer>
 #include <QFileInfo>
 #include <QPainter>
 #include <QPluginLoader>
+#include <QThread>
 #include <QTimer>
 #include <chrono>
 
@@ -55,6 +57,21 @@ const int ResolveAllItemsLimit = 500;
 // Not only the visible area, but up to ReadAheadPages before and after
 // this area will be resolved.
 const int ReadAheadPages = 5;
+
+// Cache for transformed preview pixmaps.
+// Key: URL + ModificationTime + Size + IconSize + DPR
+struct CachedPreview {
+    QPixmap pixmap;
+    bool supportsSequencing;
+};
+static QCache<QString, CachedPreview> s_previewCache;
+
+QString cacheKey(const KFileItem &item, const QSize &size, qreal dpr)
+{
+    return item.url().toString() + QLatin1Char('#') + QString::number(item.entry().numberValue(KIO::UDSEntry::UDS_MODIFICATION_TIME, -1))
+        + QLatin1Char('#') + QString::number(item.size()) + QLatin1Char('#') + QString::number(size.width()) + QLatin1Char('x')
+        + QString::number(size.height()) + QLatin1Char('#') + QString::number(dpr);
+}
 }
 
 KFileItemModelRolesUpdater::KFileItemModelRolesUpdater(KFileItemModel *model, QObject *parent)
@@ -80,7 +97,8 @@ KFileItemModelRolesUpdater::KFileItemModelRolesUpdater(KFileItemModel *model, QO
     , m_pendingSortRoleItems()
     , m_pendingIndexes()
     , m_pendingPreviewItems()
-    , m_previewJob()
+    , m_previewJobs()
+    , m_maxConcurrentJobs(qMax(1, QThread::idealThreadCount()))
     , m_hoverSequenceItem()
     , m_hoverSequenceIndex(0)
     , m_hoverSequencePreviewJob(nullptr)
@@ -94,6 +112,11 @@ KFileItemModelRolesUpdater::KFileItemModelRolesUpdater(KFileItemModel *model, QO
 #endif
 {
     Q_ASSERT(model);
+
+    // Set cache limit to something reasonable, e.g., 50 MB
+    if (s_previewCache.maxCost() != 50 * 1024 * 1024) {
+        s_previewCache.setMaxCost(50 * 1024 * 1024);
+    }
 
     const KConfigGroup globalConfig(KSharedConfig::openConfig(), QStringLiteral("PreviewSettings"));
     m_enabledPlugins = globalConfig.readEntry("Plugins", KIO::PreviewJob::defaultPlugins());
@@ -568,9 +591,21 @@ void KFileItemModelRolesUpdater::slotGotPreview(const KFileItem &item, const QPi
         return;
     }
 
+    bool supportsSequencing = false;
+    KIO::PreviewJob *job = qobject_cast<KIO::PreviewJob *>(sender());
+    if (job) {
+        supportsSequencing = job->handlesSequences();
+    }
+
+    const QPixmap transformedPixmap = transformPreviewPixmap(pixmap);
+
+    // Cache the transformed pixmap
+    const qint64 cost = transformedPixmap.width() * transformedPixmap.height() * transformedPixmap.depth() / 8;
+    s_previewCache.insert(cacheKey(item, m_iconSize, m_devicePixelRatio), new QPixmap(transformedPixmap), cost);
+
     QHash<QByteArray, QVariant> data = rolesData(item, index);
-    data.insert("iconPixmap", transformPreviewPixmap(pixmap));
-    data.insert("supportsSequencing", m_previewJob->handlesSequences());
+    data.insert("iconPixmap", transformedPixmap);
+    data.insert("supportsSequencing", supportsSequencing);
 
     disconnect(m_model, &KFileItemModel::itemsChanged, this, &KFileItemModelRolesUpdater::slotItemsChanged);
     m_model->setData(index, data);
@@ -604,17 +639,21 @@ void KFileItemModelRolesUpdater::slotPreviewFailed(const KFileItem &item)
 
 void KFileItemModelRolesUpdater::slotPreviewJobFinished()
 {
-    m_previewJob = nullptr;
+    KIO::PreviewJob *job = qobject_cast<KIO::PreviewJob *>(sender());
+    if (job) {
+        m_previewJobs.removeAll(job);
+        // job will be deleted automatically as it is a KJob
+    }
 
     if (m_state != PreviewJobRunning) {
         return;
     }
 
-    m_state = Idle;
-
+    // Schedule more jobs if we have pending items
     if (!m_pendingPreviewItems.isEmpty()) {
         startPreviewJob();
-    } else {
+    } else if (m_previewJobs.isEmpty()) {
+        m_state = Idle;
         if (!m_changedItems.isEmpty()) {
             updateChangedItems();
         }
@@ -972,28 +1011,60 @@ void KFileItemModelRolesUpdater::startPreviewJob()
 {
     m_state = PreviewJobRunning;
 
-    if (m_pendingPreviewItems.isEmpty()) {
+    // First check the cache for any pending items
+    auto it = m_pendingPreviewItems.begin();
+    while (it != m_pendingPreviewItems.end()) {
+        const KFileItem &item = *it;
+        if (CachedPreview *cachedPreview = s_previewCache.object(cacheKey(item, m_iconSize, m_devicePixelRatio))) {
+            const int index = m_model->index(item);
+            if (index >= 0) {
+                QHash<QByteArray, QVariant> data = rolesData(item, index);
+                data.insert("iconPixmap", cachedPreview->pixmap);
+                data.insert("supportsSequencing", cachedPreview->supportsSequencing);
+
+                disconnect(m_model, &KFileItemModel::itemsChanged, this, &KFileItemModelRolesUpdater::slotItemsChanged);
+                m_model->setData(index, data);
+                connect(m_model, &KFileItemModel::itemsChanged, this, &KFileItemModelRolesUpdater::slotItemsChanged);
+
+                m_finishedItems.insert(item);
+                m_changedItems.remove(item);
+            }
+            it = m_pendingPreviewItems.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    if (m_pendingPreviewItems.isEmpty() && m_previewJobs.isEmpty()) {
         QTimer::singleShot(0, this, &KFileItemModelRolesUpdater::slotPreviewJobFinished);
         return;
     }
 
-    const KFileItemList items = m_pendingPreviewItems;
-    m_pendingPreviewItems.clear();
+    while (!m_pendingPreviewItems.isEmpty() && m_previewJobs.count() < m_maxConcurrentJobs) {
+        // Take a chunk of items to process
+        const int batchSize = 50;
+        const KFileItemList items = m_pendingPreviewItems.mid(0, batchSize);
+        m_pendingPreviewItems.remove(0, items.count());
 
-    const KFileItem &referenceItem = items.first();
+        if (items.isEmpty()) {
+            break;
+        }
 
-    KIO::PreviewJob *job = new KIO::PreviewJob(items, cacheSize(), &m_enabledPlugins);
-    job->setDevicePixelRatio(m_devicePixelRatio);
-    job->setIgnoreMaximumSize(referenceItem.isLocalFile() && !referenceItem.isSlow() && m_localFileSizePreviewLimit <= 0);
-    if (job->uiDelegate()) {
-        KJobWidgets::setWindow(job, qApp->activeWindow());
+        const KFileItem &referenceItem = items.first();
+
+        KIO::PreviewJob *job = new KIO::PreviewJob(items, cacheSize(), &m_enabledPlugins);
+        job->setDevicePixelRatio(m_devicePixelRatio);
+        job->setIgnoreMaximumSize(referenceItem.isLocalFile() && !referenceItem.isSlow() && m_localFileSizePreviewLimit <= 0);
+        if (job->uiDelegate()) {
+            KJobWidgets::setWindow(job, qApp->activeWindow());
+        }
+
+        connect(job, &KIO::PreviewJob::gotPreview, this, &KFileItemModelRolesUpdater::slotGotPreview);
+        connect(job, &KIO::PreviewJob::failed, this, &KFileItemModelRolesUpdater::slotPreviewFailed);
+        connect(job, &KIO::PreviewJob::finished, this, &KFileItemModelRolesUpdater::slotPreviewJobFinished);
+
+        m_previewJobs.append(job);
     }
-
-    connect(job, &KIO::PreviewJob::gotPreview, this, &KFileItemModelRolesUpdater::slotGotPreview);
-    connect(job, &KIO::PreviewJob::failed, this, &KFileItemModelRolesUpdater::slotPreviewFailed);
-    connect(job, &KIO::PreviewJob::finished, this, &KFileItemModelRolesUpdater::slotPreviewJobFinished);
-
-    m_previewJob = job;
 }
 
 QPixmap KFileItemModelRolesUpdater::transformPreviewPixmap(const QPixmap &pixmap)
@@ -1176,9 +1247,7 @@ void KFileItemModelRolesUpdater::updateChangedItems()
             m_pendingPreviewItems.append(m_model->fileItem(index));
         }
 
-        if (!m_previewJob) {
-            startPreviewJob();
-        }
+        startPreviewJob();
     } else {
         const bool resolvingInProgress = !m_pendingIndexes.isEmpty();
         m_pendingIndexes = visibleChangedIndexes + m_pendingIndexes + invisibleChangedIndexes;
@@ -1421,14 +1490,14 @@ void KFileItemModelRolesUpdater::updateAllPreviews()
 
 void KFileItemModelRolesUpdater::killPreviewJob()
 {
-    if (m_previewJob) {
-        disconnect(m_previewJob, &KIO::PreviewJob::gotPreview, this, &KFileItemModelRolesUpdater::slotGotPreview);
-        disconnect(m_previewJob, &KIO::PreviewJob::failed, this, &KFileItemModelRolesUpdater::slotPreviewFailed);
-        disconnect(m_previewJob, &KIO::PreviewJob::finished, this, &KFileItemModelRolesUpdater::slotPreviewJobFinished);
-        m_previewJob->kill();
-        m_previewJob = nullptr;
-        m_pendingPreviewItems.clear();
+    for (KIO::PreviewJob *job : std::as_const(m_previewJobs)) {
+        disconnect(job, &KIO::PreviewJob::gotPreview, this, &KFileItemModelRolesUpdater::slotGotPreview);
+        disconnect(job, &KIO::PreviewJob::failed, this, &KFileItemModelRolesUpdater::slotPreviewFailed);
+        disconnect(job, &KIO::PreviewJob::finished, this, &KFileItemModelRolesUpdater::slotPreviewJobFinished);
+        job->kill();
     }
+    m_previewJobs.clear();
+    m_pendingPreviewItems.clear();
 }
 
 QList<int> KFileItemModelRolesUpdater::indexesToResolve() const
