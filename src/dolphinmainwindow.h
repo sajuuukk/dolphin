@@ -694,7 +694,7 @@ private:
      */
     void setupDockWidgets();
 
-    void updateFileAndEditActions();
+    void updateFileAndEditActions(const KFileItemList *selectedItems = nullptr);
     void updateViewActions();
     void updateGoActions();
 
