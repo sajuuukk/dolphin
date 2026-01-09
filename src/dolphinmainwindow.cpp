@@ -427,7 +427,7 @@ void DolphinMainWindow::slotEditableStateChanged(bool editable)
 
 void DolphinMainWindow::slotSelectionChanged(const KFileItemList &selection)
 {
-    updateFileAndEditActions();
+    updateFileAndEditActions(&selection);
 
     const int selectedUrlsCount = m_tabWidget->currentTabPage()->selectedItemsCount();
 
@@ -1709,7 +1709,10 @@ void DolphinMainWindow::activeViewChanged(DolphinViewContainer *viewContainer)
     m_actionHandler->setCurrentView(viewContainer->view());
 
     updateHistory();
-    updateFileAndEditActions();
+
+    const KFileItemList selection = viewContainer->view()->selectedItems();
+    updateFileAndEditActions(&selection);
+
     updatePasteAction();
     updateViewActions();
     updateGoActions();
@@ -1724,7 +1727,7 @@ void DolphinMainWindow::activeViewChanged(DolphinViewContainer *viewContainer)
 
     const QUrl url = viewContainer->url();
     Q_EMIT urlChanged(url);
-    Q_EMIT selectionChanged(m_activeViewContainer->view()->selectedItems());
+    Q_EMIT selectionChanged(selection);
 }
 
 void DolphinMainWindow::tabCountChanged(int count)
@@ -2591,9 +2594,9 @@ void DolphinMainWindow::setupDockWidgets()
     });
 }
 
-void DolphinMainWindow::updateFileAndEditActions()
+void DolphinMainWindow::updateFileAndEditActions(const KFileItemList *selectedItems)
 {
-    const KFileItemList list = m_activeViewContainer->view()->selectedItems();
+    const KFileItemList list = selectedItems ? *selectedItems : m_activeViewContainer->view()->selectedItems();
     const KActionCollection *col = actionCollection();
     KFileItemListProperties capabilitiesSource(list);
 
