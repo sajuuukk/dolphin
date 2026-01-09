@@ -38,6 +38,7 @@
 #include <QPluginLoader>
 #include <QThread>
 #include <QTimer>
+#include <algorithm>
 #include <chrono>
 
 using namespace std::chrono_literals;
@@ -963,12 +964,11 @@ void KFileItemModelRolesUpdater::startUpdating()
 
     if (m_previewShown) {
         m_pendingPreviewItems.clear();
-        m_pendingPreviewItems.reserve(indexes.count());
 
         for (int index : std::as_const(indexes)) {
             const KFileItem item = m_model->fileItem(index);
             if (!m_finishedItems.contains(item)) {
-                m_pendingPreviewItems.append(item);
+                m_pendingPreviewItems.push_back(item);
             }
         }
 
@@ -1012,9 +1012,7 @@ void KFileItemModelRolesUpdater::startPreviewJob()
     m_state = PreviewJobRunning;
 
     // First check the cache for any pending items
-    auto it = m_pendingPreviewItems.begin();
-    while (it != m_pendingPreviewItems.end()) {
-        const KFileItem &item = *it;
+    auto it = std::remove_if(m_pendingPreviewItems.begin(), m_pendingPreviewItems.end(), [this](const KFileItem &item) {
         if (CachedPreview *cachedPreview = s_previewCache.object(cacheKey(item, m_iconSize, m_devicePixelRatio))) {
             const int index = m_model->index(item);
             if (index >= 0) {
@@ -1029,22 +1027,27 @@ void KFileItemModelRolesUpdater::startPreviewJob()
                 m_finishedItems.insert(item);
                 m_changedItems.remove(item);
             }
-            it = m_pendingPreviewItems.erase(it);
-        } else {
-            ++it;
+            return true;
         }
-    }
+        return false;
+    });
+    m_pendingPreviewItems.erase(it, m_pendingPreviewItems.end());
 
-    if (m_pendingPreviewItems.isEmpty() && m_previewJobs.isEmpty()) {
+    if (m_pendingPreviewItems.empty() && m_previewJobs.isEmpty()) {
         QTimer::singleShot(0, this, &KFileItemModelRolesUpdater::slotPreviewJobFinished);
         return;
     }
 
-    while (!m_pendingPreviewItems.isEmpty() && m_previewJobs.count() < m_maxConcurrentJobs) {
+    while (!m_pendingPreviewItems.empty() && m_previewJobs.count() < m_maxConcurrentJobs) {
         // Take a chunk of items to process
         const int batchSize = 50;
-        const KFileItemList items = m_pendingPreviewItems.mid(0, batchSize);
-        m_pendingPreviewItems.remove(0, items.count());
+        KFileItemList items;
+        items.reserve(batchSize);
+
+        for (int i = 0; i < batchSize && !m_pendingPreviewItems.empty(); ++i) {
+            items.append(m_pendingPreviewItems.front());
+            m_pendingPreviewItems.pop_front();
+        }
 
         if (items.isEmpty()) {
             break;
@@ -1240,11 +1243,11 @@ void KFileItemModelRolesUpdater::updateChangedItems()
 
     if (m_previewShown) {
         for (int index : std::as_const(visibleChangedIndexes)) {
-            m_pendingPreviewItems.append(m_model->fileItem(index));
+            m_pendingPreviewItems.push_back(m_model->fileItem(index));
         }
 
         for (int index : std::as_const(invisibleChangedIndexes)) {
-            m_pendingPreviewItems.append(m_model->fileItem(index));
+            m_pendingPreviewItems.push_back(m_model->fileItem(index));
         }
 
         startPreviewJob();
