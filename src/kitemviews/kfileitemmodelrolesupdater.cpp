@@ -151,6 +151,7 @@ KFileItemModelRolesUpdater::KFileItemModelRolesUpdater(KFileItemModel *model, QO
         auto instance = QPluginLoader(data.fileName()).instance();
         auto plugin = qobject_cast<KOverlayIconPlugin *>(instance);
         if (plugin) {
+            plugin->setParent(this);
             m_overlayIconsPlugin.append(plugin);
             connect(plugin, &KOverlayIconPlugin::overlaysChanged, this, &KFileItemModelRolesUpdater::slotOverlaysChanged);
         } else {
@@ -1011,46 +1012,46 @@ void KFileItemModelRolesUpdater::startPreviewJob()
 {
     m_state = PreviewJobRunning;
 
-    // First check the cache for any pending items
-    auto it = std::remove_if(m_pendingPreviewItems.begin(), m_pendingPreviewItems.end(), [this](const KFileItem &item) {
-        if (CachedPreview *cachedPreview = s_previewCache.object(cacheKey(item, m_iconSize, m_devicePixelRatio))) {
-            const int index = m_model->index(item);
-            if (index >= 0) {
-                QHash<QByteArray, QVariant> data = rolesData(item, index);
-                data.insert("iconPixmap", cachedPreview->pixmap);
-                data.insert("supportsSequencing", cachedPreview->supportsSequencing);
-
-                disconnect(m_model, &KFileItemModel::itemsChanged, this, &KFileItemModelRolesUpdater::slotItemsChanged);
-                m_model->setData(index, data);
-                connect(m_model, &KFileItemModel::itemsChanged, this, &KFileItemModelRolesUpdater::slotItemsChanged);
-
-                m_finishedItems.insert(item);
-                m_changedItems.remove(item);
-            }
-            return true;
-        }
-        return false;
-    });
-    m_pendingPreviewItems.erase(it, m_pendingPreviewItems.end());
-
-    if (m_pendingPreviewItems.empty() && m_previewJobs.isEmpty()) {
-        QTimer::singleShot(0, this, &KFileItemModelRolesUpdater::slotPreviewJobFinished);
-        return;
-    }
-
-    while (!m_pendingPreviewItems.empty() && m_previewJobs.count() < m_maxConcurrentJobs) {
-        // Take a chunk of items to process
+    while (!m_pendingPreviewItems.empty()) {
+        // Prepare a batch
         const int batchSize = 50;
         KFileItemList items;
         items.reserve(batchSize);
 
-        for (int i = 0; i < batchSize && !m_pendingPreviewItems.empty(); ++i) {
-            items.append(m_pendingPreviewItems.front());
+        // Fill the batch, skipping and handling cached items
+        while (items.count() < batchSize && !m_pendingPreviewItems.empty()) {
+            const KFileItem item = m_pendingPreviewItems.front();
+
+            if (CachedPreview *cachedPreview = s_previewCache.object(cacheKey(item, m_iconSize, m_devicePixelRatio))) {
+                m_pendingPreviewItems.pop_front();
+                const int index = m_model->index(item);
+                if (index >= 0) {
+                    QHash<QByteArray, QVariant> data = rolesData(item, index);
+                    data.insert("iconPixmap", cachedPreview->pixmap);
+                    data.insert("supportsSequencing", cachedPreview->supportsSequencing);
+
+                    disconnect(m_model, &KFileItemModel::itemsChanged, this, &KFileItemModelRolesUpdater::slotItemsChanged);
+                    m_model->setData(index, data);
+                    connect(m_model, &KFileItemModel::itemsChanged, this, &KFileItemModelRolesUpdater::slotItemsChanged);
+
+                    m_finishedItems.insert(item);
+                    m_changedItems.remove(item);
+                }
+                continue;
+            }
+
+            if (items.isEmpty()) {
+                if (m_previewJobs.count() >= m_maxConcurrentJobs) {
+                    return;
+                }
+            }
+
             m_pendingPreviewItems.pop_front();
+            items.append(item);
         }
 
         if (items.isEmpty()) {
-            break;
+            continue;
         }
 
         const KFileItem &referenceItem = items.first();
@@ -1067,6 +1068,10 @@ void KFileItemModelRolesUpdater::startPreviewJob()
         connect(job, &KIO::PreviewJob::finished, this, &KFileItemModelRolesUpdater::slotPreviewJobFinished);
 
         m_previewJobs.append(job);
+    }
+
+    if (m_pendingPreviewItems.empty() && m_previewJobs.isEmpty()) {
+        QTimer::singleShot(0, this, &KFileItemModelRolesUpdater::slotPreviewJobFinished);
     }
 }
 
