@@ -1012,7 +1012,18 @@ void KFileItemModelRolesUpdater::startPreviewJob()
 {
     m_state = PreviewJobRunning;
 
+    QElapsedTimer timer;
+    timer.start();
+    // Maximum time in ms that the KFileItemModelRolesUpdater may perform a blocking operation
+    // while processing cached items. 50ms ensures ~20fps responsiveness.
+    const int maxBlockTime = 50;
+
     while (!m_pendingPreviewItems.empty()) {
+        if (timer.elapsed() > maxBlockTime) {
+            QTimer::singleShot(0, this, &KFileItemModelRolesUpdater::startPreviewJob);
+            return;
+        }
+
         // Prepare a batch
         const int batchSize = 50;
         KFileItemList items;
@@ -1020,6 +1031,10 @@ void KFileItemModelRolesUpdater::startPreviewJob()
 
         // Fill the batch, skipping and handling cached items
         while (items.count() < batchSize && !m_pendingPreviewItems.empty()) {
+            if (timer.elapsed() > maxBlockTime) {
+                break;
+            }
+
             const KFileItem item = m_pendingPreviewItems.front();
 
             if (CachedPreview *cachedPreview = s_previewCache.object(cacheKey(item, m_iconSize, m_devicePixelRatio))) {
@@ -1051,6 +1066,10 @@ void KFileItemModelRolesUpdater::startPreviewJob()
         }
 
         if (items.isEmpty()) {
+            if (timer.elapsed() > maxBlockTime && !m_pendingPreviewItems.empty()) {
+                QTimer::singleShot(0, this, &KFileItemModelRolesUpdater::startPreviewJob);
+                return;
+            }
             continue;
         }
 
