@@ -10,7 +10,6 @@
 #include "dolphin_export.h"
 #include "kitemviews/kitemmodelbase.h"
 
-#include <list>
 #include <deque>
 
 #include "config-dolphin.h"
@@ -408,7 +407,7 @@ private:
     int m_hoverSequenceIndex;
     KIO::PreviewJob *m_hoverSequencePreviewJob;
     int m_hoverSequenceNumSuccessiveFailures;
-    std::list<KFileItem> m_hoverSequenceLoadedItems;
+    std::deque<KFileItem> m_hoverSequenceLoadedItems;
 
     // When downloading or copying large files, the slot slotItemsChanged()
     // will be called periodically within a quite short delay. To prevent
