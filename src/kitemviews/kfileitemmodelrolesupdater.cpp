@@ -40,6 +40,9 @@
 #include <QTimer>
 #include <algorithm>
 #include <chrono>
+#include <memory>
+
+#include <QStringBuilder>
 
 using namespace std::chrono_literals;
 
@@ -69,9 +72,9 @@ static QCache<QString, CachedPreview> s_previewCache;
 
 QString cacheKey(const KFileItem &item, const QSize &size, qreal dpr)
 {
-    return item.url().toString() + QLatin1Char('#') + QString::number(item.entry().numberValue(KIO::UDSEntry::UDS_MODIFICATION_TIME, -1))
-        + QLatin1Char('#') + QString::number(item.size()) + QLatin1Char('#') + QString::number(size.width()) + QLatin1Char('x')
-        + QString::number(size.height()) + QLatin1Char('#') + QString::number(dpr);
+    return item.url().toString() % QLatin1Char('#') % QString::number(item.entry().numberValue(KIO::UDSEntry::UDS_MODIFICATION_TIME, -1))
+        % QLatin1Char('#') % QString::number(item.size()) % QLatin1Char('#') % QString::number(size.width()) % QLatin1Char('x')
+        % QString::number(size.height()) % QLatin1Char('#') % QString::number(dpr);
 }
 }
 
@@ -603,7 +606,9 @@ void KFileItemModelRolesUpdater::slotGotPreview(const KFileItem &item, const QPi
 
     // Cache the transformed pixmap
     const qint64 cost = transformedPixmap.width() * transformedPixmap.height() * transformedPixmap.depth() / 8;
-    s_previewCache.insert(cacheKey(item, m_iconSize, m_devicePixelRatio), new QPixmap(transformedPixmap), cost);
+    auto cachedPreview = std::make_unique<CachedPreview>(CachedPreview{transformedPixmap, supportsSequencing});
+    const QString key = cacheKey(item, m_iconSize, m_devicePixelRatio);
+    s_previewCache.insert(key, cachedPreview.release(), cost);
 
     QHash<QByteArray, QVariant> data = rolesData(item, index);
     data.insert("iconPixmap", transformedPixmap);
