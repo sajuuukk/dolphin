@@ -32,6 +32,7 @@
 
 #include <QApplication>
 #include <QCache>
+#include <QHash>
 #include <QElapsedTimer>
 #include <QFileInfo>
 #include <QPainter>
@@ -68,13 +69,43 @@ struct CachedPreview {
     QPixmap pixmap;
     bool supportsSequencing;
 };
-static QCache<QString, CachedPreview> s_previewCache;
 
-QString cacheKey(const KFileItem &item, const QSize &size, qreal dpr)
+struct PreviewCacheKey {
+    QUrl url;
+    long long modificationTime;
+    KIO::filesize_t size;
+    int iconWidth;
+    int iconHeight;
+    qreal devicePixelRatio;
+
+    bool operator==(const PreviewCacheKey &other) const
+    {
+        return modificationTime == other.modificationTime &&
+               size == other.size &&
+               iconWidth == other.iconWidth &&
+               iconHeight == other.iconHeight &&
+               qFuzzyCompare(devicePixelRatio, other.devicePixelRatio) &&
+               url == other.url;
+    }
+};
+
+size_t qHash(const PreviewCacheKey &key, size_t seed = 0)
 {
-    return item.url().toString() % QLatin1Char('#') % QString::number(item.entry().numberValue(KIO::UDSEntry::UDS_MODIFICATION_TIME, -1))
-        % QLatin1Char('#') % QString::number(item.size()) % QLatin1Char('#') % QString::number(size.width()) % QLatin1Char('x')
-        % QString::number(size.height()) % QLatin1Char('#') % QString::number(dpr);
+    return qHashMulti(seed, key.url, key.modificationTime, key.size, key.iconWidth, key.iconHeight, key.devicePixelRatio);
+}
+
+static QCache<PreviewCacheKey, CachedPreview> s_previewCache;
+
+PreviewCacheKey cacheKey(const KFileItem &item, const QSize &size, qreal dpr)
+{
+    return PreviewCacheKey{
+        item.url(),
+        item.entry().numberValue(KIO::UDSEntry::UDS_MODIFICATION_TIME, -1),
+        item.size(),
+        size.width(),
+        size.height(),
+        dpr
+    };
 }
 }
 
@@ -1023,16 +1054,18 @@ void KFileItemModelRolesUpdater::startPreviewJob()
     // while processing cached items. 50ms ensures ~20fps responsiveness.
     const int maxBlockTime = 50;
 
+    // Prepare a batch
+    const int batchSize = 50;
+    KFileItemList items;
+    items.reserve(batchSize);
+
     while (!m_pendingPreviewItems.empty()) {
         if (timer.elapsed() > maxBlockTime) {
             QTimer::singleShot(0, this, &KFileItemModelRolesUpdater::startPreviewJob);
             return;
         }
 
-        // Prepare a batch
-        const int batchSize = 50;
-        KFileItemList items;
-        items.reserve(batchSize);
+        items.clear();
 
         // Fill the batch, skipping and handling cached items
         while (items.count() < batchSize && !m_pendingPreviewItems.empty()) {
@@ -1542,6 +1575,7 @@ QList<int> KFileItemModelRolesUpdater::indexesToResolve() const
     // Add visible items.
     // Resolve files first, their previews are quicker.
     QList<int> visibleDirs;
+    visibleDirs.reserve(m_lastVisibleIndex - m_firstVisibleIndex + 1);
     for (int i = m_firstVisibleIndex; i <= m_lastVisibleIndex; ++i) {
         const KFileItem item = m_model->fileItem(i);
         if (item.isDir()) {
@@ -1627,7 +1661,7 @@ void KFileItemModelRolesUpdater::resetSizeData(const int index, const int size)
     connect(m_model, &KFileItemModel::itemsChanged, this, &KFileItemModelRolesUpdater::slotItemsChanged);
 }
 
-void KFileItemModelRolesUpdater::recountDirectoryItems(const QList<QUrl> directories)
+void KFileItemModelRolesUpdater::recountDirectoryItems(const QList<QUrl> &directories)
 {
     for (const auto &dir : directories) {
         auto index = m_model->index(dir);
